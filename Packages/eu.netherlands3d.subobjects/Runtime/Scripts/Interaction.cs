@@ -1,0 +1,145 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace Netherlands3D.SubObjects
+{
+    public static class Interaction
+    {
+        public static readonly Color NO_OVERRIDE_COLOR = new Color(0, 0, 1, 0);
+        public delegate void ObjectMappingHandler(ObjectMapping mapping);
+        public static event ObjectMappingHandler ObjectMappingCheckIn;
+        public static event ObjectMappingHandler ObjectMappingCheckOut;
+
+        private static List<Color> vertexcolors = new();
+        static List<ObjectMapping> mappings;
+        
+        private static Dictionary<string, Color> overrideColors = new(); //permanent overriodes
+        private static readonly Dictionary<(string layerId, string objectId), Color> layerColors = new(); //results from styling
+        private static readonly Dictionary<(string layerId, string objectId), Color> selectionColors = new(); //selected objects
+        
+
+        internal static void CheckIn(ObjectMapping mapping)
+        {
+            if (mappings == null)
+            {
+                mappings = new List<ObjectMapping>();
+            }
+            mappings.Add(mapping);
+            ObjectMappingCheckIn?.Invoke(mapping);
+            //apply after objectmappingcheckin invoke!
+            ApplyColors(mapping);
+        }
+
+        internal static void CheckOut(ObjectMapping mapping)
+        {
+            if (mappings.Contains(mapping))
+            {
+                mappings.Remove(mapping);
+                ObjectMappingCheckOut?.Invoke(mapping);
+            }
+        }
+
+        //todo solve duplicate colors
+        public static void AddOverrideColors(Dictionary<string, Color> colorMap)
+        {
+            foreach (var kv in colorMap)
+                overrideColors[kv.Key] = kv.Value; 
+        }
+        
+        public static void AddOverrideColor(string key, Color color) => overrideColors[key] = color;
+        
+        public static void RemoveOverrideColors(Dictionary<string, Color> colorMap)
+        {
+            foreach (var kv in colorMap)
+                overrideColors.Remove(kv.Key);
+        }
+        
+        public static void RemoveOverrideColor(string key) => overrideColors.Remove(key);
+        
+       
+
+        public static void AddLayerColor(string layerId, string objectId, Color color)
+        {
+            layerColors[(layerId, objectId)] = color;
+        }
+
+        public static bool TryGetLayerColor(string layerId, string objectId, out Color color)
+        {
+            return layerColors.TryGetValue((layerId, objectId), out color);
+        }
+
+        public static void RemoveLayerColor(string layerId, string objectId)
+        {
+            layerColors.Remove((layerId, objectId));
+        }
+        
+        public static void AddSelectionColor(string layerId, string objectId, Color color)
+        {
+            selectionColors[(layerId, objectId)] = color;
+        }
+
+        public static bool TryGetSelectionColor(string layerId, string objectId, out Color color)
+        {
+            return selectionColors.TryGetValue((layerId, objectId), out color);
+        }
+
+        public static void RemoveSelectionColor(string layerId, string objectId)
+        {
+            selectionColors.Remove((layerId, objectId));
+        }
+        
+        public static void RemoveSelectionColors()
+        {
+            selectionColors.Clear();
+        }
+
+        //TODO we will need a cascading coloring system to apply colors, when multiple colors are registred to one bagid, is this still needed?
+        /// <summary>
+        /// This will color the final result from styling, by its objectmapping it will find the corresponding bagids in the override color dictionairy apply mesh vertex coloring
+        /// </summary>
+        /// <param name="mapping"></param>
+        public static void ApplyColors(ObjectMapping mapping, string layerId = null)
+        {
+            GameObject gameobject = mapping.gameObject;
+            if (gameobject == null) return;
+            Mesh mesh = gameobject.GetComponent<MeshFilter>().mesh;
+            if (mesh == null)   return;
+          
+            if (vertexcolors.Capacity < mesh.vertexCount)
+                vertexcolors.Capacity = mesh.vertexCount;
+            
+            bool applied = false;
+            foreach(KeyValuePair<string, ObjectMappingItem> item in mapping.items)
+            {
+                Color color;
+                if (overrideColors.ContainsKey(item.Key))
+                {
+                    color = overrideColors[item.Key];
+                    applied = true;
+                }
+                else if(layerId != null)
+                {
+                    Color layerColor;
+                    if (TryGetSelectionColor(layerId, item.Key, out layerColor))
+                        color = layerColor;
+                    else if (TryGetLayerColor(layerId, item.Key, out layerColor))
+                        color = layerColor;
+                    else
+                        color = NO_OVERRIDE_COLOR;
+                    applied = true;
+                }
+                else
+                {
+                    color = NO_OVERRIDE_COLOR;
+                }
+                
+                int vertexcount = item.Value.verticesLength;
+                for (int j = 0; j < vertexcount; j++)
+                    vertexcolors.Add(color);
+            }
+            if(applied)
+                mesh.SetColors(vertexcolors);
+            vertexcolors.Clear();
+        }
+    }
+}

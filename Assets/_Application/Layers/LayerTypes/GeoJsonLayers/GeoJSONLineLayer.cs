@@ -1,0 +1,262 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using GeoJSON.Net.Feature;
+using GeoJSON.Net.Geometry;
+using Netherlands3D.Coordinates;
+using Netherlands3D.Twin.Rendering;
+using Netherlands3D.Twin.Utility;
+using UnityEngine;
+
+namespace Netherlands3D.Twin.Layers.LayerTypes.GeoJsonLayers
+{
+    [Serializable]
+    public partial class GeoJSONLineLayer : MonoBehaviour, IGeoJsonVisualisationLayer
+    {
+        public bool IsPolygon => false;
+
+        public Transform Transform => transform;
+
+        public event IGeoJsonVisualisationLayer.GeoJsonHandler FeatureRemoved;
+
+        private Dictionary<Feature, FeatureLineVisualisations> spawnedVisualisations = new();
+        public Dictionary<Feature, FeatureLineVisualisations> SpawnedVisualisations => spawnedVisualisations;
+        private readonly List<Feature> visualisationOrder = new();
+        private readonly Dictionary<Feature, Color> featureColors = new();
+        private readonly Dictionary<Feature, float> featureWidthMultipliers = new();
+        private List<List<Coordinate>> visualisationsToRemove = new();
+        private List<List<Coordinate>> selectionList = new();
+        
+        [SerializeField] private LineRenderer3D lineRenderer3D;
+        [SerializeField] private LineRenderer3D selectionLineRenderer3D;
+        
+        public LineRenderer3D LineRenderer3D
+        {
+            get => lineRenderer3D;
+            //todo: move old lines to new renderer, remove old lines from old renderer without clearing entire list?
+            set => lineRenderer3D = value;
+        }
+        
+        public Color RenderColor
+        {
+            get
+            {
+                return LineRenderer3D.LineMaterial.color;
+            }
+            set
+            {
+                // Ensure that LineRenderer3D.Material has a Material Instance to prevent accidental destruction
+                // of a material asset when replacing the material - no destroy of the old material must be done because
+                // that is an asset and not an instance
+                lineRenderer3D.LineMaterial = new Material(lineRenderer3D.LineMaterial);
+                
+                //todo: we currently only support coloring the entire layer, if we want to support per feature coloring, this should be changed to a function with a feature as a parameter
+                lineRenderer3D.SetAllColors(value);
+            }
+        }
+        public List<Mesh> GetMeshData(Feature feature)
+        {
+            FeatureLineVisualisations data = spawnedVisualisations[feature];
+            List<Mesh> meshes = new List<Mesh>();
+            if (data == null)
+            {
+                Debug.LogWarning("visualisation was not spawned for feature" + feature.Id);
+                return meshes;
+            }
+
+            foreach (List<Coordinate> points in data.Data)
+            {
+                Mesh mesh = new Mesh();
+                meshes.Add(mesh);
+                List<Vector3> vertices = new List<Vector3>();
+                foreach (Coordinate point in points)
+                {
+                    vertices.Add(point.ToUnity());
+                }
+
+                mesh.SetVertices(vertices);
+            }
+
+            return meshes;
+        }
+
+        public Bounds GetFeatureBounds(Feature feature)
+        {
+            return spawnedVisualisations[feature].trueBounds;
+        }
+
+        public float GetSelectionRange()
+        {
+            return lineRenderer3D.MaximumRenderedDiameter;
+        }
+
+        //because the transfrom will always be at the V3zero position we dont want to offset with the localoffset
+        //the vertex positions will equal world space
+        //also we are using the actual feature geometry to find the vertices in the targeted buffers
+        public void SetVisualisationSelected(Transform transform, List<Mesh> meshes, Color color)
+        {
+            selectionList.Clear();
+            foreach (Mesh mesh in meshes)
+            {
+                Vector3[] vertices = mesh.vertices; // The meshes are from the world object, not the lineRenderer positions
+                List<Coordinate> line = new List<Coordinate>();
+                for (int i = 0; i < vertices.Length; i++)
+                {
+                    var coordinate = new Coordinate(vertices[i]);
+                    line.Add(coordinate);
+                }
+
+                selectionList.Add(line);
+            }
+
+            selectionLineRenderer3D.PointMaterial.color = color;
+            selectionLineRenderer3D.SetPositionCollections(selectionList);
+        }
+
+        public void SetVisualisationDeselected() //todo rename this?
+        {
+            selectionLineRenderer3D.Clear();
+        }
+
+        public void OnLayerActiveInHierarchyChanged(bool activeInHierarchy)
+        {
+            LineRenderer3D.gameObject.SetActive(activeInHierarchy);
+        }
+
+        public void AddAndVisualizeFeature(Feature feature, CoordinateSystem originalCoordinateSystem, bool activeInHierarchy)
+        {
+            // Skip if feature already exists (comparison is done using hashcode based on geometry)
+            if (spawnedVisualisations.ContainsKey(feature)) return;
+
+            var newFeatureVisualisation = new FeatureLineVisualisations { feature = feature };
+            
+            if (feature.Geometry is MultiLineString multiLineString)
+            {
+                var newLines = GeometryVisualizationFactory.CreateLineVisualisation(multiLineString, originalCoordinateSystem, lineRenderer3D);
+                newFeatureVisualisation.Data.AddRange(newLines);
+            }
+
+            if (feature.Geometry is LineString lineString)
+            {
+                var newLine = GeometryVisualizationFactory.CreateLineVisualization(lineString, originalCoordinateSystem, lineRenderer3D);
+                newFeatureVisualisation.Data.Add(newLine);
+            }
+
+            newFeatureVisualisation.SetBoundsPadding(Vector3.one * GetSelectionRange());
+            newFeatureVisualisation.CalculateBounds();
+
+            spawnedVisualisations.Add(feature, newFeatureVisualisation);
+            visualisationOrder.Add(feature);
+        }
+
+        /// <summary>
+        /// Clears only the currently visualized features. The parent GeoJSON layer can keep the parsed source
+        /// features and repopulate this renderer with a filtered time slice.
+        /// </summary>
+        public void ClearVisualizedFeatures()
+        {
+            foreach (var feature in visualisationOrder.ToList())
+                FeatureRemoved?.Invoke(feature);
+
+            spawnedVisualisations.Clear();
+            visualisationOrder.Clear();
+            featureColors.Clear();
+            featureWidthMultipliers.Clear();
+            lineRenderer3D.Clear();
+            SetVisualisationDeselected();
+        }
+
+        /// <summary>
+        /// Applies per-feature color and width styling while preserving the renderer's feature insertion order.
+        /// MultiLineStrings repeat the feature style for each of their line collections.
+        /// </summary>
+        public void SetFeatureStyles(
+            IReadOnlyDictionary<Feature, Color> colors,
+            IReadOnlyDictionary<Feature, float> widthMultipliers)
+        {
+            var requestedColors = colors?.ToDictionary(pair => pair.Key, pair => pair.Value);
+            var requestedWidths = widthMultipliers?.ToDictionary(pair => pair.Key, pair => pair.Value);
+
+            featureColors.Clear();
+            featureWidthMultipliers.Clear();
+
+            var collectionColors = new List<Color>();
+            var collectionWidths = new List<float>();
+            foreach (var feature in visualisationOrder)
+            {
+                if (!spawnedVisualisations.TryGetValue(feature, out var visualisation))
+                    continue;
+
+                var color = requestedColors != null && requestedColors.TryGetValue(feature, out var requestedColor)
+                    ? requestedColor
+                    : RenderColor;
+                var width = requestedWidths != null && requestedWidths.TryGetValue(feature, out var requestedWidth)
+                    ? requestedWidth
+                    : 1f;
+
+                featureColors[feature] = color;
+                featureWidthMultipliers[feature] = width;
+
+                for (var i = 0; i < visualisation.Data.Count; i++)
+                {
+                    collectionColors.Add(color);
+                    collectionWidths.Add(width);
+                }
+            }
+
+            lineRenderer3D.SetCollectionWidthMultipliers(collectionWidths);
+            lineRenderer3D.SetCollectionColors(collectionColors);
+        }
+
+        /// <summary>
+        /// Checks the Bounds of the visualisations and checks them against the camera frustum
+        /// to remove visualisations that are out of view
+        /// </summary>
+        public void RemoveFeaturesOutOfView()
+        {
+            // Remove visualisations that are out of view
+            var frustumPlanes = GeometryUtility.CalculateFrustumPlanes(Camera.main);
+
+            visualisationsToRemove.Clear();
+            foreach (var kvp in spawnedVisualisations.Reverse())
+            {
+                var inCameraFrustum = GeometryUtility.TestPlanesAABB(frustumPlanes, kvp.Value.tiledBounds);
+                if (inCameraFrustum) continue;
+
+                visualisationsToRemove.AddRange(kvp.Value.Data);
+                RemoveFeature(kvp.Value);
+            }
+
+            lineRenderer3D.RemovePointCollections(visualisationsToRemove);
+            SetFeatureStyles(featureColors, featureWidthMultipliers);
+        }
+
+        private void RemoveFeature(FeatureLineVisualisations featureVisualisation)
+        {
+            FeatureRemoved?.Invoke(featureVisualisation.feature);
+            spawnedVisualisations.Remove(featureVisualisation.feature);
+            visualisationOrder.Remove(featureVisualisation.feature);
+            featureColors.Remove(featureVisualisation.feature);
+            featureWidthMultipliers.Remove(featureVisualisation.feature);
+        }
+
+        public BoundingBox GetBoundingBoxOfVisibleFeatures()
+        {
+            if (spawnedVisualisations.Count == 0)
+                return null;
+
+            BoundingBox bbox = null;
+            foreach (var vis in spawnedVisualisations.Values)
+            {
+                if (bbox == null)
+                    bbox = new BoundingBox(vis.trueBounds);
+                else
+                    bbox.Encapsulate(vis.trueBounds);
+            }
+
+            var crs2D = CoordinateSystems.To2D(bbox.CoordinateSystem);
+            bbox.Convert(crs2D); //remove the height, since a GeoJSON is always 2D. This is needed to make the centering work correctly
+            return bbox;
+        }
+    }
+}

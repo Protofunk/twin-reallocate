@@ -1,0 +1,46 @@
+using System.Runtime.Serialization;
+using Netherlands3D.Twin.Layers.Properties;
+using Newtonsoft.Json;
+using UnityEngine.Events;
+
+namespace Netherlands3D.Functionalities.ObjectLibrary
+{
+    [DataContract(Namespace = "https://netherlands3d.eu/schemas/projects/layers/properties", Name = "Windmill")]
+    public class WindmillPropertyData : LayerPropertyData
+    {
+        [DataMember] private float axisHeight = 120f;
+        [DataMember] private float rotorDiameter = 120f;
+        
+        [JsonIgnore] public readonly UnityEvent<float> OnRotorDiameterChanged = new();
+        [JsonIgnore] public readonly UnityEvent<float> OnAxisHeightChanged = new();
+        
+        [JsonIgnore]
+        public float RotorDiameter
+        {
+            get => rotorDiameter;
+            set
+            {
+                rotorDiameter = value;
+                OnRotorDiameterChanged.Invoke(rotorDiameter);
+            }
+        }
+
+        [JsonIgnore]
+        public float AxisHeight
+        {
+            get => axisHeight;
+            set
+            {
+                axisHeight = value;
+                OnAxisHeightChanged.Invoke(axisHeight);
+            }
+        }
+
+        [JsonConstructor]
+        public WindmillPropertyData(float axisHeight, float rotorDiameter)
+        {
+            this.axisHeight = axisHeight;
+            this.rotorDiameter = rotorDiameter;
+        }
+    }
+}

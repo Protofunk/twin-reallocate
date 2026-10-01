@@ -1,0 +1,181 @@
+using System;
+using System.Collections.Generic;
+using Netherlands3D.Credentials;
+using Netherlands3D.Credentials.StoredAuthorization;
+using Netherlands3D.Services;
+using Netherlands3D.Tiles3D;
+using Netherlands3D.Twin;
+using Netherlands3D.Twin.Layers;
+using Netherlands3D.Twin.Layers.ExtensionMethods;
+using Netherlands3D.Twin.Layers.LayerTypes.Credentials.Properties;
+using Netherlands3D.Twin.Layers.Properties;
+using Netherlands3D.Twin.Utility;
+using UnityEngine;
+using UnityEngine.Networking;
+
+namespace Netherlands3D.Functionalities.OGC3DTiles
+{
+    [RequireComponent(typeof(ReadSubtree))]
+    [RequireComponent(typeof(Read3DTileset))]
+    public class Tile3DLayerGameObject : LayerGameObject, IVisualizationWithPropertyData
+    {
+        public override BoundingBox Bounds => TileSet.root != null ? new BoundingBox(TileSet.root.BottomLeft, TileSet.root.TopRight) : null;
+
+        private Read3DTileset tileSet;
+        public Read3DTileset TileSet => GetAndCacheComponent(ref tileSet);
+
+        private ICredentialHandler credentialHandler;
+        private ICredentialHandler CredentialHandler => GetAndCacheComponent(ref credentialHandler);
+
+        private void EnableTileset()
+        {
+            if (!TileSet.enabled)
+                TileSet.enabled = true;
+            else
+                TileSet.RefreshTiles();
+        }
+
+        protected override void OnVisualizationInitialize()
+        {
+            CredentialHandler.OnAuthorizationHandled.AddListener(HandleCredentials);
+        }
+
+        private void HandleCredentials(Uri uri, StoredAuthorization auth)
+        {
+            ClearCredentials();
+
+            if (auth.GetType() != typeof(Public))//if it is public, we don't want the property panel to show up
+            {
+                InitProperty<CredentialsRequiredPropertyData>(LayerData.LayerProperties);
+            }
+            
+            switch (auth) //todo: pass auth.GetConfig to the tileset instead of this switch statement.
+            {
+                case FailedOrUnsupported:
+                    LayerData.HasValidCredentials = false;
+                    TileSet.enabled = false;
+                    return;
+                case HeaderBasedAuthorization headerBasedAuthorization:
+                    var (headerName, headerValue) = headerBasedAuthorization.GetHeaderKeyAndValue();
+                    TileSet.AddCustomHeader(headerName, headerValue, true);
+                    break;
+                case QueryStringAuthorization queryStringAuthorization:
+                    TileSet.personalKey = queryStringAuthorization.QueryKeyValue;
+                    TileSet.publicKey = queryStringAuthorization.QueryKeyValue;
+                    TileSet.QueryKeyName = queryStringAuthorization.QueryKeyName;
+                    break;
+                case Public:
+                    break; //nothing specific needed, but it needs to be excluded from default
+                default:
+                    throw new NotImplementedException("Credential type " + auth.GetType() + " is not supported by " + GetType());
+            }
+
+            //also do this for public
+            LayerData.HasValidCredentials = true;
+            TileSet.RefreshTiles();
+            TileSet.enabled = true;
+        }
+
+        protected override void OnEnable()
+        {
+            base.OnEnable();
+            TileSet.unsupportedExtensionsParsed.AddListener(InvokeUnsupportedExtensionsMessage);
+            TileSet.OnServerResponseReceived.AddListener(ProcessServerResponse);
+        }
+
+        protected override void OnDisable()
+        {
+            base.OnDisable();
+            TileSet.unsupportedExtensionsParsed.RemoveListener(InvokeUnsupportedExtensionsMessage);
+            TileSet.OnServerResponseReceived.RemoveListener(ProcessServerResponse);
+        }
+        
+        protected override void OnVisualizationReady()
+        {
+            var tile3DPropertyData = LayerData.GetProperty<Tile3DLayerPropertyData>();
+            var hasEmptyUrl = tile3DPropertyData.Url == null || string.IsNullOrEmpty(tile3DPropertyData.Url.ToString());
+            if (hasEmptyUrl && !string.IsNullOrEmpty(TileSet.tilesetUrl)) //if we are making a new layer, we should take the serialized url from the tileset if it exists.
+            {
+                UpdateURL(new Uri(TileSet.tilesetUrl));
+            }
+            else
+            {
+                UpdateURL(tile3DPropertyData.Url);
+            }
+
+            UpdateCRS(tile3DPropertyData.ContentCRS);
+            ServiceLocator.GetService<Tile3DLayerSet>().Attach(this);
+        }
+
+        private void ProcessServerResponse(UnityWebRequest request)
+        {
+            LayerData.HasValidCredentials = request.result == UnityWebRequest.Result.Success;
+        }
+
+        private void UpdateURL(Uri storedUri)
+        {
+            CredentialHandler.Uri = storedUri; //apply the URL from what is stored in the Project data
+            TileSet.tilesetUrl = storedUri.ToString();
+            CredentialHandler.ApplyCredentials();
+            EnableTileset();
+        }
+
+        private void UpdateCRS(int crs)
+        {
+            TileSet.SetCoordinateSystem((Coordinates.CoordinateSystem)crs);
+        }
+
+        public override void OnLayerActiveInHierarchyChanged(bool isActive)
+        {
+            gameObject.SetActive(isActive);
+        }
+
+        private void InvokeUnsupportedExtensionsMessage(string[] unsupportedExtensions)
+        {
+            if (unsupportedExtensions.Length == 0)
+                return;
+
+            string message = Name + " contains the following unsupported extensions: ";
+            foreach (var extension in unsupportedExtensions)
+            {
+                message += "\n" + extension;
+            }
+
+            // TODO: Route unsupported extension warnings through a generic layer message flow.
+            App.LayerMessages.UnsupportedExtensionsMessage(message);
+        }
+
+        public void ClearCredentials()
+        {
+            TileSet.personalKey = "";
+            TileSet.publicKey = "";
+            TileSet.QueryKeyName = "key";
+            TileSet.ClearKeyFromURL();
+            TileSet.RefreshTiles();
+        }
+
+        public void LoadProperties(List<LayerPropertyData> properties)
+        {            
+            InitProperty<Tile3DLayerPropertyData>(properties, null, TileSet.tilesetUrl);
+            Tile3DLayerPropertyData tile3DPropertyData = properties.Get<Tile3DLayerPropertyData>();
+            UpdateURL(tile3DPropertyData.Url);
+            UpdateCRS(tile3DPropertyData.ContentCRS);
+        }
+        
+        protected override void RegisterEventListeners()
+        {
+            base.RegisterEventListeners();
+            var tile3DPropertyData = LayerData.GetProperty<Tile3DLayerPropertyData>();
+            tile3DPropertyData.OnUrlChanged.AddListener(UpdateURL);
+            tile3DPropertyData.OnCRSChanged.AddListener(UpdateCRS);
+        }
+
+        protected override void UnregisterEventListeners()
+        {
+            base.UnregisterEventListeners();
+            var tile3DPropertyData = LayerData.GetProperty<Tile3DLayerPropertyData>();
+            tile3DPropertyData.OnUrlChanged.RemoveListener(UpdateURL);
+            tile3DPropertyData.OnCRSChanged.RemoveListener(UpdateCRS);
+        }
+    }
+}

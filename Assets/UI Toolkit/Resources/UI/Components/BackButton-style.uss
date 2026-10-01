@@ -1,0 +1,13 @@
+@import url("IconButton-style.uss");
+
+.backbutton {
+    --button-hover-contrast-color: var(--color-blue-300);
+}
+
+.backbutton > .unity-label {
+    display: none;
+}
+
+.backbutton:hover > #Icon {
+    -unity-background-image-tint-color: var(--button-hover-contrast-color);
+}

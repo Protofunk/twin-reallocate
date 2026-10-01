@@ -1,0 +1,7 @@
+.asset-library-panel__footer{
+    margin-top: var(--spacing-2);
+    flex-shrink: 0;
+    flex-direction: row;
+    justify-content: flex-end;
+    align-items: center;
+}

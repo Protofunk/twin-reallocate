@@ -1,0 +1,96 @@
+﻿using System;
+using System.Collections.Generic;
+using JetBrains.Annotations;
+using Netherlands3D.Credentials.StoredAuthorization;
+using Netherlands3D.LayerStyles;
+using Netherlands3D.Twin.Layers.LayerPresets;
+using Netherlands3D.Twin.Layers.Properties;
+using Netherlands3D.Twin.Projects;
+using UnityEngine;
+
+namespace Netherlands3D.Twin.Layers
+{
+    public class LayerBuilder : ILayerBuilder
+    {
+        internal string Type { get; private set; }
+        private string Name { get; set; }
+        private Color? Color { get; set; }
+        internal List<LayerPropertyData> Properties { get; } = new();
+        [CanBeNull] private Symbolizer DefaultSymbolizer { get; set; }
+        private Action<LayerData> whenBuilt;
+        
+        internal LayerBuilder()
+        {
+        }
+
+        public static ILayerBuilder Create() => new LayerBuilder();
+
+        public static ILayerBuilder Create(LayerPresetArgs args) => LayerPresetRegistry.Create(args);
+
+        public ILayerBuilder OfType(string type)
+        {
+            Type = type;
+            
+            return this;
+        }
+
+        public ILayerBuilder NamedAs(string name)
+        {
+            Name = name;
+            
+            return this;
+        }
+
+        public ILayerBuilder WithColor(Color color)
+        {
+            Color = color;
+            
+            return this;
+        }
+
+        public ILayerBuilder AddProperty(LayerPropertyData property)
+        {
+            Properties.Add(property);
+            
+            return this;
+        }
+
+        public ILayerBuilder AddProperties(params LayerPropertyData[] properties)
+        {
+            Properties.AddRange(properties);
+            
+            return this;
+        }
+
+        public ILayerBuilder SetDefaultStyling(Symbolizer symbolizer)
+        {
+            DefaultSymbolizer = symbolizer;
+            
+            return this;
+        }
+        
+        public ILayerBuilder WhenBuilt(Action<LayerData> callback)
+        {
+            this.whenBuilt = callback;
+
+            return this;
+        }
+
+        public LayerData Build()
+        {            
+            LayerData layerData = new LayerData(Name, Type);
+            
+            if (!string.IsNullOrEmpty(Name)) layerData.Name = Name;
+            if (Color.HasValue) layerData.Color = Color.Value;
+
+            foreach (var property in Properties)
+            {
+                layerData.SetProperty(property);
+            }
+
+            whenBuilt?.Invoke(layerData);
+
+            return layerData;
+        }
+    }
+}

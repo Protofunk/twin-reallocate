@@ -1,0 +1,117 @@
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.Serialization;
+using Newtonsoft.Json;
+using UnityEngine.Events;
+
+namespace Netherlands3D.Twin.Layers.LayerTypes
+{
+    [DataContract(Namespace = "https://netherlands3d.eu/schemas/projects/layers", Name = "Root")]
+    public class RootLayer : LayerData
+    {
+        [JsonIgnore] public List<LayerData> SelectedLayers { get; private set; } = new();
+        
+        public UnityEvent<LayerData> AddedSelectedLayer = new();
+        public UnityEvent<LayerData> RemovedSelectedLayer = new();
+
+        public RootLayer(string name) : base(name)
+        {
+           
+        }
+
+        public void AddLayerToSelection(LayerData layer)
+        {
+            if (!SelectedLayers.Contains(layer))
+            {
+                SelectedLayers.Add(layer);
+                AddedSelectedLayer.Invoke(layer);
+            }
+        }
+        
+        public void RemoveLayerFromSelection(LayerData layer)
+        {
+            if (SelectedLayers.Remove(layer))
+                RemovedSelectedLayer.Invoke(layer);
+        }
+
+        public void DeselectAllLayers()
+        {
+            // Make a copy of the SelectedLayers list because the Deselect function removes
+            // the selected layer from this list; and the enumeration fails without a copy
+            foreach (var selectedLayer in SelectedLayers.ToList())
+            {
+                selectedLayer.DeselectLayer();
+            }
+        }
+
+        public override void Dispose()
+        {
+            foreach (var child in ChildrenLayers.ToList()) //use ToList to make a copy and avoid a CollectionWasModified error
+            {
+                child.Dispose();
+            }
+            
+            LayerDestroyed.Invoke();
+        }
+
+        public void ReconstructParentsRecursive()
+        {
+            foreach (var layer in ChildrenLayers)
+            {
+                ReconstructParentsRecursive(layer, this);
+            }
+        }
+
+        private void ReconstructParentsRecursive(LayerData layer, LayerData parent)
+        {
+            layer.InitializeParent(parent);
+            foreach (var child in layer.ChildrenLayers)
+            {
+                ReconstructParentsRecursive(child, layer);
+            }
+        }
+
+        public void AddChild(LayerData layer, int siblingIndex = -1)
+        {
+            if (!ChildrenLayers.Contains(layer))
+            {
+                if (siblingIndex >= 0 && siblingIndex < ChildrenLayers.Count)
+                    ChildrenLayers.Insert(siblingIndex, layer);
+                else
+                    ChildrenLayers.Add(layer);
+                
+                UpdateLayerTreeOrder(-1); //recalculate the RootIndices since the hierarchy changed
+                ChildrenChanged.Invoke();
+            }
+        }
+
+        public void UpdateLayerTreeOrder(int index)
+        {
+            List<LayerData> children = GetLayerDataTree();
+            int count = children.Count();
+            for (int i = 0; i < count; i++)
+            {
+                children[i].RootId = i-1; //substract 1 so the rootLayer has index -1 instead of 0
+            }
+        }
+
+        public List<LayerData> GetFlatHierarchy()
+        {
+            var list = new List<LayerData>();
+
+            AddLayersRecursive(this, list);
+
+            list.Remove(this); //remove rootLayer
+            return list;
+        }
+
+        private void AddLayersRecursive(LayerData layer, List<LayerData> list)
+        {
+            list.Add(layer);
+            foreach (var child in layer.ChildrenLayers)
+            {
+                AddLayersRecursive(child, list);
+            }
+        }
+    }
+}

@@ -1,0 +1,340 @@
+﻿name: Actions
+on: [push]
+
+env:
+  BUILD_OUTPUT_FOLDER: 'build/WebGL/WebGL'
+  PRODUCTION_BUILD_ARTEFACT_NAME: 'viewer'
+  DEVELOPMENT_BUILD_ARTEFACT_NAME: 'viewer-development'
+  PREVIEW_BUILD_ARTEFACT_NAME: 'viewer-reallocate-preview'
+
+jobs:
+  ## See: https://game.ci/docs/github/test-runner
+  test:
+    name: '🐞️ Automated tests (${{ matrix.testMode }})'
+    permissions: { contents: read, checks: write }
+
+    strategy:
+      fail-fast: false
+      matrix:
+        testMode:
+          #- playmode # Temporarily disabled because tests fail and should be fixed first
+          - editmode
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: actions/cache@v3
+        with:
+          path: Library
+          key: Library-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+          restore-keys: |
+            Library-
+      - uses: game-ci/unity-test-runner@v4
+        id: tests
+        env:
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          testMode: ${{ matrix.testMode }}
+          artifactsPath: ${{ matrix.testMode }}-artifacts
+          githubToken: ${{ secrets.GITHUB_TOKEN }}
+          checkName: Test Results (${{ matrix.testMode }})
+          coverageOptions: 'generateAdditionalMetrics;generateHtmlReport;generateBadgeReport'
+          customParameters: '-buildTarget webgl'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Test results for ${{ matrix.testMode }}
+          path: ${{ steps.tests.outputs.artifactsPath }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Coverage results for ${{ matrix.testMode }}
+          path: ${{ steps.tests.outputs.coveragePath }}
+
+  build:
+    name: '🗺️ Build Netherlands3D Viewer'
+    needs: [ 'test' ]
+    permissions: { contents: read }
+
+    # only run this when a commit was pushed to the main branch
+    if: github.ref_name == 'main'
+
+    outputs:
+      buildVersion: ${{ steps.buildUnity.outputs.buildVersion }} 
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Free Disk Space'
+        # see: https://github.com/jlumbroso/free-disk-space  
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+
+      - name: 'Checkout code from repository'
+        # see: https://github.com/actions/checkout      
+        uses: actions/checkout@v4
+        with: { lfs: true }
+
+      - name: 'Cache Library folder - restore and track'
+        # see: https://github.com/actions/cache      
+        uses: actions/cache@v4
+        with:
+          path: 'Library'
+          key: Library-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+          restore-keys: |
+            Library-
+
+      - name: 'Build Unity project to WebGL'
+        id: buildUnity # used when building the docker container to get the version number from
+        # See https://game.ci/docs/github/getting-started
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          targetPlatform: WebGL
+          unityVersion: auto
+          # A custom specific image can be used (source: https://github.com/game-ci/unity-builder/blob/main/action.yml):
+          # customImage: unityci/editor:ubuntu-2022.3.8f1-webgl-2
+
+      - name: 'Upload artifact to build pipeline'
+        # see: https://github.com/actions/upload-artifact      
+        uses: actions/upload-artifact@v4
+        with: { name: '${{ env.PRODUCTION_BUILD_ARTEFACT_NAME }}', path: '${{ env.BUILD_OUTPUT_FOLDER }}' }
+
+  build-development:
+    name: '🐞 Build Development Netherlands3D Viewer'
+    needs: [ 'test' ]
+    permissions: { contents: read }
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Free Disk Space'
+        # see: https://github.com/jlumbroso/free-disk-space  
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+
+      - name: 'Checkout code from repository'
+        # see: https://github.com/actions/checkout      
+        uses: actions/checkout@v4
+        with: { lfs: true }
+
+      - name: 'Cache Library folder - restore and track'
+        # see: https://github.com/actions/cache      
+        uses: actions/cache@v4
+        with:
+          path: 'Library'
+          key: Library-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+          restore-keys: |
+            Library-
+
+      - name: 'Build Unity project to WebGL'
+        # See https://game.ci/docs/github/getting-started
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          targetPlatform: WebGL
+          customParameters: '-Development -AllowDebugging'
+          # A custom specific image can be used (source: https://github.com/game-ci/unity-builder/blob/main/action.yml):
+          # customImage: unityci/editor:ubuntu-2022.3.8f1-webgl-2
+          unityVersion: auto
+
+      - name: 'Upload artifact to build pipeline'
+        # see: https://github.com/actions/upload-artifact
+        uses: actions/upload-artifact@v4
+        with: { name: '${{ env.DEVELOPMENT_BUILD_ARTEFACT_NAME }}', path: '${{ env.BUILD_OUTPUT_FOLDER }}' }
+
+  build-preview:
+    name: '🚀 Build Optimized Reallocate Preview'
+    if: github.ref_name == 'feature/REALLOCATE-pre-oplevering'
+    needs: [ 'test' ]
+    permissions: { contents: read }
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Free Disk Space'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+
+      - name: 'Checkout code from repository'
+        uses: actions/checkout@v4
+        with: { lfs: true }
+
+      - name: 'Cache Library folder - restore and track'
+        uses: actions/cache@v4
+        with:
+          path: 'Library'
+          key: Library-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+          restore-keys: |
+            Library-
+
+      - name: 'Build optimized Unity project to WebGL'
+        # Deliberately omit Unity's -Development and -AllowDebugging flags so
+        # this separate preview has the same runtime optimizations as main.
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          targetPlatform: WebGL
+          unityVersion: auto
+
+      - name: 'Upload optimized preview artifact'
+        id: uploadPreviewBuild
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PREVIEW_BUILD_ARTEFACT_NAME }}
+          path: ${{ env.BUILD_OUTPUT_FOLDER }}
+
+      - name: 'Add optimized preview artifact link to summary'
+        shell: bash
+        run: |
+          echo '## Optimized WebGL preview' >> "$GITHUB_STEP_SUMMARY"
+          echo "[Download this run's preview build](${{ steps.uploadPreviewBuild.outputs.artifact-url }})" >> "$GITHUB_STEP_SUMMARY"
+
+  # Set PROTOFUNK_PAGES_ENABLED to false (or remove it) to stop deployments.
+  # Removing the deploy key from the external repository fully revokes writes.
+  deploy-preview:
+    name: '🌐 Deploy Optimized Preview to Protofunk Pages'
+    if: github.ref_name == 'feature/REALLOCATE-pre-oplevering' && vars.PROTOFUNK_PAGES_ENABLED == 'true'
+    needs: [ 'build-preview' ]
+    permissions: { contents: read }
+    concurrency:
+      group: protofunk-reallocate-preview
+      cancel-in-progress: true
+
+    environment:
+      name: 'protofunk-preview'
+      url: 'https://protofunk.github.io/twin-reallocate/'
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Download optimized preview artifact'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.PREVIEW_BUILD_ARTEFACT_NAME }}
+          path: ${{ env.BUILD_OUTPUT_FOLDER }}
+
+      - name: 'Publish preview to external GitHub Pages repository'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          deploy_key: ${{ secrets.PROTOFUNK_PAGES_DEPLOY_KEY }}
+          external_repository: 'Protofunk/twin-reallocate'
+          publish_branch: gh-pages
+          publish_dir: ${{ env.BUILD_OUTPUT_FOLDER }}
+          enable_jekyll: false
+          full_commit_message: 'Deploy Netherlands3D Twin preview from ${{ github.sha }}'
+      
+  build-docker-image:
+    name: '🐳 Build and Publish Docker Image'
+
+    # only run this when a commit was pushed to the main branch
+    if: github.ref_name == 'main'
+
+    # only run this after the 'build' stage has successfully completed 
+    needs: [ 'build' ]
+    
+    permissions:
+      contents: read
+      packages: write
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Checkout repository'
+        # see: https://github.com/actions/checkout
+        uses: actions/checkout@v4
+        with: { lfs: true }
+
+      - name: 'Download built viewer'
+        # see: https://github.com/actions/download-artifact
+        uses: actions/download-artifact@v4
+        with: { name: '${{ env.PRODUCTION_BUILD_ARTEFACT_NAME }}', path: '${{ env.BUILD_OUTPUT_FOLDER }}' }
+
+      - name: 'Show Version'
+        run: 'echo "Version: ${{ needs.build.outputs.buildVersion }}"'
+
+      - name: 'Docker: Login to GitHub Container Registry'
+        uses: docker/login-action@v3
+        with:
+          registry: 'ghcr.io'
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 'Docker: Build and push image'
+        if: github.ref_name == 'main' # double ensure this is only on main, in case of debugging
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: .docker/viewer/Dockerfile
+          push: true
+          build-args: |
+            SOURCE_PATH=${{ env.BUILD_OUTPUT_FOLDER }}
+          tags: |
+            ghcr.io/netherlands3d/twin:${{ needs.build.outputs.buildVersion }}
+            ghcr.io/netherlands3d/twin:latest
+
+  deploy:
+    name: '🌐 Deploy the viewer to Github Pages'
+    
+    # only run this when a commit was pushed to the main branch
+    if: github.ref_name == 'main'
+    
+    # only run this after the 'build' stage has successfully completed 
+    needs: build
+    
+    permissions:
+      pages: write
+      id-token: write
+    
+    environment:
+      name: 'github-pages'
+      url: ${{ steps.deployment.outputs.page_url }}
+    
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Download built viewer'
+        # see: https://github.com/actions/download-artifact
+        uses: actions/download-artifact@v4
+        with: { name: '${{ env.PRODUCTION_BUILD_ARTEFACT_NAME }}', path: '${{ env.BUILD_OUTPUT_FOLDER }}' }
+      
+      - name: 'Prepare artefact for deployment'
+        if: github.ref_name == 'main' # double ensure this is only on main, in case of debugging
+        # see: https://github.com/actions/upload-pages-artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '${{ env.BUILD_OUTPUT_FOLDER }}'
+      
+      - name: 'Deploy to GitHub Pages'
+        if: github.ref_name == 'main' # double ensure this is only on main, in case of debugging
+        id: deployment
+        # see: https://github.com/actions/deploy-pages
+        uses: actions/deploy-pages@v4

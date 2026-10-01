@@ -1,0 +1,583 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEngine;
+using GeoJSON.Net;
+using GeoJSON.Net.Feature;
+using GeoJSON.Net.Geometry;
+using Netherlands3D.Coordinates;
+using Netherlands3D.Twin.Layers.Properties;
+using Netherlands3D.Credentials;
+using Netherlands3D.Credentials.StoredAuthorization;
+using Netherlands3D.Functionalities.ObjectInformation;
+using Netherlands3D.LayerStyles;
+using Netherlands3D.Twin.Layers.LayerTypes.CartesianTiles.Properties;
+using Netherlands3D.Twin.Layers.LayerTypes.Credentials.Properties;
+using Netherlands3D.Twin.Layers.LayerTypes.HierarchicalObject;
+using Netherlands3D.Twin.Projects;
+using Netherlands3D.Twin.Projects.ExtensionMethods;
+using Netherlands3D.Twin.Utility;
+using Netherlands3D.Services;
+using Netherlands3D.Twin.UI;
+
+namespace Netherlands3D.Twin.Layers.LayerTypes.GeoJsonLayers
+{
+    [RequireComponent(typeof(ICredentialHandler))]
+    public class GeoJsonLayerGameObject : LayerGameObject, IVisualizationWithPropertyData
+    {
+        public override BoundingBox Bounds
+        {
+            get
+            {
+                var pointBounds = pointFeaturesLayer.GetBoundingBoxOfVisibleFeatures();
+                var lineBounds = lineFeaturesLayer.GetBoundingBoxOfVisibleFeatures();
+                var polygonBounds = polygonFeaturesLayer.GetBoundingBoxOfVisibleFeatures();
+
+                if (pointBounds != null)
+                {
+                    pointBounds.Encapsulate(lineBounds);
+                    pointBounds.Encapsulate(polygonBounds);
+                    return pointBounds;
+                }
+
+                if (lineBounds != null)
+                {
+                    lineBounds.Encapsulate(polygonBounds);
+                    return lineBounds;
+                }
+
+                return polygonBounds;
+            }
+        }
+
+        private GeoJSONParser parser = new GeoJSONParser(0.01f);
+        public GeoJSONParser Parser => parser;
+
+        [Header("Visualizer settings")]
+        [SerializeField] private GeoJSONPolygonLayer polygonFeaturesLayer;
+        [SerializeField] private GeoJSONLineLayer lineFeaturesLayer;
+        [SerializeField] private GeoJSONPointLayer pointFeaturesLayer;
+
+        [Header("Annotation settings")]
+        [SerializeField] private WorldAnnotationLayerGameObject annotationLayerPrefab;
+
+        private bool hasPolygons;
+        private bool hasLines;
+        private bool hasPoints;
+
+        private readonly List<WorldAnnotationLayerGameObject> spawnedAnnotations = new();
+
+        /// <summary>
+        /// Optional hook for components that index source features but only render a filtered subset, such as the
+        /// traffic timeline. Returning false keeps the feature in GeoJsonFeatures without creating render data.
+        /// </summary>
+        public Func<Feature, bool> FeatureVisualisationFilter { get; set; }
+        public event Action<Feature> FeatureAdded;
+
+        private ICredentialHandler credentialHandler;
+        private bool startLoadingDataWhenLayerBecomesActive = false;
+
+        public List<Feature> GeoJsonFeatures { get; private set; } = new();
+        
+        protected override void OnVisualizationInitialize()
+        {
+            credentialHandler = GetComponent<ICredentialHandler>();
+            LayerFeatures.Add(polygonFeaturesLayer, LayerFeature.Create(this, polygonFeaturesLayer));
+            LayerFeatures.Add(lineFeaturesLayer, LayerFeature.Create(this, lineFeaturesLayer));
+            LayerFeatures.Add(pointFeaturesLayer, LayerFeature.Create(this, pointFeaturesLayer));
+
+            polygonFeaturesLayer.RenderColor = LayerData.Color;
+            lineFeaturesLayer.RenderColor = LayerData.Color;
+            pointFeaturesLayer.RenderColor = LayerData.Color;
+        }
+
+        protected override void OnVisualizationReady()
+        {
+            var urlPropertyData = LayerData.GetProperty<LayerURLPropertyData>();
+            UpdateURL(urlPropertyData.Url);
+        }
+
+        protected virtual void UpdateURL(Uri storedUri)
+        {
+            if (storedUri == credentialHandler.Uri && credentialHandler.Authorization != null)
+            {
+                HandleCredentials(storedUri, credentialHandler.Authorization);
+                return;
+            }
+
+            credentialHandler.Uri = storedUri; //apply the URL from what is stored in the Project data
+            credentialHandler.ApplyCredentials();
+        }
+
+        protected virtual void HandleCredentials(Uri uri, StoredAuthorization auth)
+        {
+            if (auth.GetType() != typeof(Public)) //if it is public, we don't want the property panel to show up
+            {
+                InitProperty<CredentialsRequiredPropertyData>(LayerData.LayerProperties);
+            }
+
+            if (auth is FailedOrUnsupported)
+            {
+                LayerData.HasValidCredentials = false;
+                return;
+            }
+
+            LayerData.HasValidCredentials = true;
+
+            if (LayerData.ActiveInHierarchy)
+            {
+                StartLoadingData(uri, auth);
+            }
+            else
+            {
+                startLoadingDataWhenLayerBecomesActive = true;
+            }
+        }
+
+        protected void StartLoadingData(Uri uri, StoredAuthorization auth)
+        {
+            if (uri.IsStoredInProject())
+            {
+                string path = AssetUriFactory.GetLocalPath(uri);
+                StartCoroutine(parser.ParseGeoJSONLocal(path));
+            }
+            else if (uri.IsRemoteAsset())
+            {
+                StartCoroutine(parser.ParseGeoJSONStreamRemote(uri, auth));
+            }
+        }
+
+        public override void OnLayerActiveInHierarchyChanged(bool isActive)
+        {
+            base.OnLayerActiveInHierarchyChanged(isActive);
+            if (!LayerData.HasValidCredentials) //in case we activate the layer for the first time, and we have invalid credentials, reset the loading flag and wait for valid credentials
+            {
+                startLoadingDataWhenLayerBecomesActive = false;
+                return;
+            }
+
+            if (isActive && startLoadingDataWhenLayerBecomesActive) //in case we activate the layer with valid credentials for the first time, and we are still waiting for a load, parse the data.
+            {
+                var auth = credentialHandler.Authorization;
+                var uri = auth.SanitizeUrl(credentialHandler.Uri);
+                StartLoadingData(uri, auth);
+                startLoadingDataWhenLayerBecomesActive = false;
+            }
+
+            polygonFeaturesLayer.OnLayerActiveInHierarchyChanged(isActive);
+            lineFeaturesLayer.OnLayerActiveInHierarchyChanged(isActive);
+            pointFeaturesLayer.OnLayerActiveInHierarchyChanged(isActive);
+        }
+
+        protected override void RegisterEventListeners()
+        {
+            base.RegisterEventListeners();
+            parser.OnFeatureParsed.AddListener(AddFeatureVisualisation);
+            parser.OnParseError.AddListener(VisualisationError.Invoke);
+            
+            credentialHandler?.OnAuthorizationHandled.AddListener(HandleCredentials);
+            
+            polygonFeaturesLayer.FeatureRemoved += OnFeatureRemoved;
+            lineFeaturesLayer.FeatureRemoved += OnFeatureRemoved;
+            pointFeaturesLayer.FeatureRemoved += OnFeatureRemoved;
+        }
+
+        protected override void UnregisterEventListeners()
+        {
+            base.UnregisterEventListeners();
+            parser.OnFeatureParsed.RemoveListener(AddFeatureVisualisation);
+            parser.OnParseError.RemoveListener(VisualisationError.Invoke);
+            
+            credentialHandler?.OnAuthorizationHandled.RemoveListener(HandleCredentials);
+            
+            polygonFeaturesLayer.FeatureRemoved -= OnFeatureRemoved;
+            lineFeaturesLayer.FeatureRemoved -= OnFeatureRemoved;
+            pointFeaturesLayer.FeatureRemoved -= OnFeatureRemoved;
+        }
+
+        public void AddFeatureVisualisation(Feature feature)
+        {
+            var originalCoordinateSystem = GeoJSONParser.GetCoordinateSystem(feature.CRS);
+            VisualizeFeature(feature, originalCoordinateSystem);
+        }
+
+        /// <summary>
+        /// Load properties is only used when restoring a layer from a project file.
+        /// After getting the property containing the url, the GeoJSON file is downloaded and parsed.
+        /// </summary>
+        public virtual void LoadProperties(List<LayerPropertyData> properties)
+        {
+            InitProperty<ColorPropertyData>(properties);
+        }
+
+        /// <summary>
+        /// Removes features based on the bounds of their visualisations
+        /// </summary>
+        public void RemoveFeaturesOutOfView()
+        {
+            polygonFeaturesLayer?.RemoveFeaturesOutOfView();
+            lineFeaturesLayer?.RemoveFeaturesOutOfView();
+            pointFeaturesLayer?.RemoveFeaturesOutOfView();
+        }
+
+        private void CreateFeatureMappingsForFeature(Feature feature, IGeoJsonVisualisationLayer layer)
+        {
+            var meshData = layer?.GetMeshData(feature);
+            if (meshData != null)
+            {
+                CreateFeatureMappings(layer, feature, meshData);
+            }
+        }
+
+        private void CreateFeatureMappings(IGeoJsonVisualisationLayer layer, Feature feature, List<Mesh> meshes)
+        {
+            FeatureMapping objectMapping = new FeatureMapping();
+            objectMapping.SetFeature(feature);
+            objectMapping.SetMeshes(meshes);
+            objectMapping.SetVisualisationLayer(layer);
+            objectMapping.SetGeoJsonLayerParent(this);
+            objectMapping.UpdateBoundingBox();
+            SelectionService.MappingTree.RootInsert(objectMapping);
+        }
+
+        private void VisualizeFeature(Feature feature, CoordinateSystem crs)
+        {
+            switch (feature.Geometry.Type)
+            {
+                case GeoJSONObjectType.MultiPolygon:
+                case GeoJSONObjectType.Polygon:
+                    AddFeature(feature, crs, polygonFeaturesLayer);
+                    if (!hasPolygons)
+                    {
+                        hasPolygons = true;
+                        InitStylingRules(Symbolizer.FillColorProperty, LayerData.Color);
+                    }
+                    return;
+                case GeoJSONObjectType.MultiLineString:
+                case GeoJSONObjectType.LineString:
+                    AddFeature(feature, crs, lineFeaturesLayer);
+                    if (!hasLines)
+                    {
+                        hasLines = true;
+                        InitStylingRules(Symbolizer.StrokeColorProperty, LayerData.Color);
+                    }
+                    return;
+                case GeoJSONObjectType.MultiPoint:
+                case GeoJSONObjectType.Point:
+                    if (IsAnnotationFeature(feature))
+                    {
+                        SpawnAnnotationFeature(feature, crs);
+                        return;
+                    }
+
+                    AddFeature(feature, crs, pointFeaturesLayer);
+                    if (!hasPoints)
+                    {
+                        hasPoints = true;
+                        InitStylingRules(Symbolizer.PointColorProperty, LayerData.Color);
+                    }
+                    return;
+                default:
+                    throw new InvalidCastException("Features of type " + feature.Geometry.Type + " are not supported for visualization");
+            }
+        }
+
+        private static bool IsAnnotationFeature(Feature feature)
+        {
+            if (feature?.Properties == null) return false;
+
+            return HasNonEmptyProperty(feature, "annotationText")
+                   || HasNonEmptyProperty(feature, "thumbnailUrl")
+                   || HasNonEmptyProperty(feature, "thumbnailPath")
+                   || HasNonEmptyProperty(feature, "previewUrl")
+                   || HasNonEmptyProperty(feature, "imageUrl")
+                   || HasNonEmptyProperty(feature, "imagePath")
+                   || HasNonEmptyProperty(feature, "image")
+                   || HasNonEmptyProperty(feature, "imageCaption")
+                   || HasNonEmptyProperty(feature, "caption");
+        }
+
+        private static bool HasNonEmptyProperty(Feature feature, string key)
+        {
+            if (feature?.Properties == null) return false;
+            if (!feature.Properties.TryGetValue(key, out var value)) return false;
+            return value != null && !string.IsNullOrWhiteSpace(value.ToString());
+        }
+
+        private static string GetStringProperty(Feature feature, params string[] keys)
+        {
+            if (feature?.Properties == null) return "";
+
+            foreach (string key in keys)
+            {
+                if (!feature.Properties.TryGetValue(key, out var value) || value == null) continue;
+
+                string stringValue = value.ToString();
+                if (!string.IsNullOrWhiteSpace(stringValue))
+                    return stringValue;
+            }
+
+            return "";
+        }
+
+        private static string GetAnnotationName(Feature feature, string fallbackText)
+        {
+            string title = GetStringProperty(feature, "title", "name", "label");
+            if (!string.IsNullOrWhiteSpace(title))
+                return title;
+
+            if (!string.IsNullOrWhiteSpace(fallbackText))
+                return fallbackText.Length <= 64 ? fallbackText : fallbackText[..64];
+
+            return "GeoJSON Annotation";
+        }
+
+        private void SpawnAnnotationFeature(Feature feature, CoordinateSystem coordinateSystem)
+        {
+            if (annotationLayerPrefab == null)
+            {
+                VisualisationError.Invoke("GeoJSON annotations kunnen niet worden ingeladen: annotationLayerPrefab ontbreekt.");
+                return;
+            }
+
+            string text = GetStringProperty(feature, "annotationText", "text", "description", "title");
+            string imageUrl = GetStringProperty(feature, "imageUrl", "imagePath", "image");
+            string imagePreviewUrl = GetStringProperty(feature, "thumbnailUrl", "thumbnailPath", "previewUrl");
+            if (string.IsNullOrWhiteSpace(imagePreviewUrl))
+                imagePreviewUrl = imageUrl;
+
+            string imageCaption = GetStringProperty(feature, "imageCaption", "caption");
+            string annotationName = GetAnnotationName(feature, text);
+
+            switch (feature.Geometry)
+            {
+                case Point point:
+                    SpawnAnnotationAtCoordinate(
+                        ConvertPointToCoordinate(point.Coordinates, coordinateSystem),
+                        annotationName,
+                        text,
+                        imageUrl,
+                        imagePreviewUrl,
+                        imageCaption
+                    );
+                    break;
+
+                case MultiPoint multiPoint:
+                    foreach (Point point in multiPoint.Coordinates)
+                    {
+                        SpawnAnnotationAtCoordinate(
+                            ConvertPointToCoordinate(point.Coordinates, coordinateSystem),
+                            annotationName,
+                            text,
+                            imageUrl,
+                            imagePreviewUrl,
+                            imageCaption
+                        );
+                    }
+                    break;
+            }
+        }
+
+        private static Coordinate ConvertPointToCoordinate(IPosition point, CoordinateSystem originalCoordinateSystem)
+        {
+            var coordinate = new Coordinate(originalCoordinateSystem)
+            {
+                easting = point.Longitude,
+                northing = point.Latitude
+            };
+
+            if (point.Altitude != null)
+            {
+                coordinate.height = (double)point.Altitude;
+            }
+            else
+            {
+                coordinate = coordinate.Convert(CoordinateSystem.RDNAP);
+                coordinate.height = 0;
+            }
+
+            return coordinate;
+        }
+
+        private void SpawnAnnotationAtCoordinate(
+            Coordinate coordinate,
+            string annotationName,
+            string text,
+            string imageUrl,
+            string imagePreviewUrl,
+            string imageCaption)
+        {
+            ILayerBuilder layerBuilder = LayerBuilder.Create()
+                .OfType(annotationLayerPrefab.PrefabIdentifier)
+                .NamedAs(annotationName)
+                .AddProperty(new AnnotationPropertyData(text, imageUrl, imagePreviewUrl, imageCaption));
+
+            var layer = App.Layers.Add(layerBuilder, spawnedLayer =>
+            {
+                if (spawnedLayer is not WorldAnnotationLayerGameObject annotation) return;
+
+                annotation.InitializeFromImportedData(coordinate, text, imageUrl, imagePreviewUrl, imageCaption);
+                spawnedAnnotations.Add(annotation);
+            });
+
+            layer.LayerData.SetParent(LayerData);
+        }
+
+        private void AddFeature(Feature feature, CoordinateSystem originalCoordinateSystem, IGeoJsonVisualisationLayer layer)
+        {
+            GeoJsonFeatures.Add(feature);
+            FeatureAdded?.Invoke(feature);
+
+            if (FeatureVisualisationFilter != null && !FeatureVisualisationFilter(feature))
+                return;
+
+            layer.AddAndVisualizeFeature(feature, originalCoordinateSystem, LayerData.ActiveInHierarchy);
+            CreateFeatureMappingsForFeature(feature, layer);
+        }
+
+        /// <summary>
+        /// Replaces the visible line features without discarding the parsed GeoJSON source collection.
+        /// This is used by time-series layers to render only the active time slice.
+        /// </summary>
+        public void SetVisibleTimelineLineFeatures(
+            IReadOnlyList<Feature> features,
+            IReadOnlyDictionary<Feature, Color> colors,
+            IReadOnlyDictionary<Feature, float> widthMultipliers)
+        {
+            lineFeaturesLayer.ClearVisualizedFeatures();
+
+            foreach (var feature in features)
+            {
+                if (feature?.Geometry == null
+                    || feature.Geometry.Type != GeoJSONObjectType.LineString
+                    && feature.Geometry.Type != GeoJSONObjectType.MultiLineString)
+                    continue;
+
+                var coordinateSystem = GeoJSONParser.GetCoordinateSystem(feature.CRS);
+                lineFeaturesLayer.AddAndVisualizeFeature(feature, coordinateSystem, LayerData.ActiveInHierarchy);
+                CreateFeatureMappingsForFeature(feature, lineFeaturesLayer);
+            }
+
+            lineFeaturesLayer.SetFeatureStyles(colors, widthMultipliers);
+        }
+
+        /// <summary>
+        /// Applies contextual per-feature styling without replacing the parsed or visible feature collection.
+        /// </summary>
+        public void SetLineFeatureStyles(
+            IReadOnlyDictionary<Feature, Color> colors,
+            IReadOnlyDictionary<Feature, float> widthMultipliers)
+        {
+            lineFeaturesLayer.SetFeatureStyles(colors, widthMultipliers);
+        }
+
+        public void SetPointFeatureStyles(IReadOnlyDictionary<Feature, Color> colors)
+        {
+            pointFeaturesLayer.SetFeatureStyles(colors);
+        }
+
+        public bool TryGetFeatureCenter(Feature feature, out Vector3 center)
+        {
+            center = default;
+            if (feature?.Geometry == null)
+                return false;
+
+            try
+            {
+                center = GetVisualisationLayerForFeature(feature).GetFeatureBounds(feature).center;
+                return true;
+            }
+            catch (KeyNotFoundException)
+            {
+                return false;
+            }
+        }
+        
+        protected virtual void OnFeatureRemoved(Feature feature)
+        {
+            //we have to query first to find the corresponding featuremappings, cant do a remove right away
+            //alternative could be to make an extra method to query by feature and do remove, or as proposed caching cell ids (but this can cause bugs, since spatial data is "truth")           
+            IGeoJsonVisualisationLayer layer = GetVisualisationLayerForFeature(feature);
+            BoundingBox queryBoundingBox = FeatureMapping.CreateBoundingBoxForFeature(feature, layer);
+            List<IMapping> mappings = SelectionService.MappingTree.Query<FeatureMapping>(queryBoundingBox);
+            foreach (FeatureMapping mapping in mappings)
+            {
+                if (mapping.Feature == feature)
+                {
+                    //destroy featuremapping object, there should be no references anywhere else to this object!
+                    SelectionService.MappingTree.Remove(mapping);
+                }
+            }
+        }
+
+        public IGeoJsonVisualisationLayer GetVisualisationLayerForFeature(Feature feature)
+        {
+            switch (feature.Geometry.Type)
+            {
+                case GeoJSONObjectType.MultiPolygon:
+                case GeoJSONObjectType.Polygon:
+                    return polygonFeaturesLayer;
+                case GeoJSONObjectType.MultiLineString:
+                case GeoJSONObjectType.LineString:
+                    return lineFeaturesLayer;
+                case GeoJSONObjectType.MultiPoint:
+                case GeoJSONObjectType.Point:
+                    return pointFeaturesLayer;
+                default:
+                    throw new InvalidCastException("Features of type " + feature.Geometry.Type + " are not supported for visualization layer");
+            }
+        }
+
+        public override void ApplyStyling()
+        {
+            if(hasPolygons)
+                ApplyGeoJsonVisualisationLayerStyling(polygonFeaturesLayer, Symbolizer.FillColorProperty);
+            if(hasLines)
+                ApplyGeoJsonVisualisationLayerStyling(lineFeaturesLayer, Symbolizer.StrokeColorProperty);
+            if(hasPoints)
+                ApplyGeoJsonVisualisationLayerStyling(pointFeaturesLayer, Symbolizer.PointColorProperty);
+            
+            var colorPropertyData = LayerData.GetProperty<ColorPropertyData>();
+            var colorTypes = colorPropertyData.GetUsedColorTypes();
+            if (colorTypes.Count == 1) //if only one color type is used (only points/only lines/only polygons), we will set the layer color to that color.
+            {
+                switch (colorTypes[0])
+                {
+                    case Symbolizer.FillColorProperty:
+                        LayerData.Color = polygonFeaturesLayer.RenderColor;
+                        break;
+                    case Symbolizer.StrokeColorProperty:
+                        LayerData.Color = lineFeaturesLayer.RenderColor;
+                        break;
+                    case Symbolizer.PointColorProperty:
+                        LayerData.Color = pointFeaturesLayer.RenderColor;
+                        break;
+                }
+            }
+        }
+
+        private void ApplyGeoJsonVisualisationLayerStyling(IGeoJsonVisualisationLayer visualisationLayer, string key)
+        {
+            var feature = LayerFeatures[visualisationLayer];
+            var symbolizer = GetStyling(feature);
+            var fillColor = symbolizer.GetColor(key);
+            // Keep the original material color if fill color is not set (null)
+            if (!fillColor.HasValue) return;
+
+            var newColor = fillColor.Value;
+            var a = polygonFeaturesLayer.RenderColor.a; //todo: support alpha in the colorpicker
+            newColor.a = a;
+            
+            visualisationLayer.RenderColor = newColor;
+        }
+
+        private void InitStylingRules(string propertyKey, Color color)
+        {
+            var colorPropertyData = LayerData.GetProperty<ColorPropertyData>();
+            colorPropertyData.ColorType = propertyKey;
+            colorPropertyData.SetDefaultSymbolizerColor(color);
+            
+            ApplyStyling();
+        }
+    }
+}

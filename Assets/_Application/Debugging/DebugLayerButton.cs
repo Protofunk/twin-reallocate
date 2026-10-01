@@ -1,0 +1,40 @@
+using System;
+using Netherlands3D.Credentials;
+using Netherlands3D.Credentials.StoredAuthorization;
+using Netherlands3D.DataTypeAdapters;
+using UnityEngine;
+
+namespace Netherlands3D.Twin
+{
+    public class DebugLayerButton : MonoBehaviour
+    {
+        [SerializeField] private string url;
+        private CredentialHandler handler;
+        private DataTypeChain dataTypeChain;
+
+        private void Start()
+        {
+            dataTypeChain = GetComponentInParent<DataTypeChain>();
+            handler = GetComponentInParent<CredentialHandler>();
+        }
+
+        public void Spawn()
+        {
+            if (!string.IsNullOrEmpty(url))
+            {
+                handler.Uri = new Uri(url);
+                handler.OnAuthorizationHandled.AddListener(DetermineAdapter);
+                handler.ApplyCredentials();
+            }
+        }
+
+        private void DetermineAdapter(Uri uri, StoredAuthorization auth)
+        {            
+            if(url != uri.ToString())
+                return;
+
+            App.Layers.AddFromUrl(uri, auth); //todo: Exceptions should still be handled
+            handler.OnAuthorizationHandled.RemoveListener(DetermineAdapter);
+        }
+    }
+}

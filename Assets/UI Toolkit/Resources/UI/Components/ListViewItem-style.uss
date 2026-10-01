@@ -1,0 +1,22 @@
+.listview-item {
+    background-color: transparent;
+}
+
+.listview-item__container{    
+    flex-direction: row;
+    align-items: center;
+    border-color:  var(--color-blue-200);
+}
+
+.listview-item > * {
+    align-items: center;
+}
+
+.unity-collection-view__item:checked {
+    background-color: var(--color-blue-100);
+    border-color: var(--color-blue-700);
+}
+
+.unity-collection-view__item:hover {
+    background-color: var(--color-blue-200);
+}

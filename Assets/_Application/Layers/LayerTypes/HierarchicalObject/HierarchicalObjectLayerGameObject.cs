@@ -1,0 +1,426 @@
+﻿using System;
+using System.Collections.Generic;
+using Netherlands3D.Coordinates;
+using Netherlands3D.Functionalities.ObjectInformation;
+using Netherlands3D.LayerStyles;
+using Netherlands3D.Services;
+using Netherlands3D.Twin.FloatingOrigin;
+using Netherlands3D.Twin.Layers.ExtensionMethods;
+using Netherlands3D.Twin.Layers.LayerTypes.HierarchicalObject.Properties;
+using Netherlands3D.Twin.Layers.LayerTypes.Polygons;
+using Netherlands3D.Twin.Layers.LayerTypes.Polygons.Properties;
+using Netherlands3D.Twin.Layers.Properties;
+using Netherlands3D.Twin.Samplers;
+using Netherlands3D.Twin.UI;
+using Netherlands3D.Twin.Utility;
+using Netherlands3D.UI.Panels;
+using UnityEngine;
+using UnityEngine.Events;
+using UnityEngine.EventSystems;
+
+namespace Netherlands3D.Twin.Layers.LayerTypes.HierarchicalObject
+{
+    [RequireComponent(typeof(WorldTransform))]
+    public class HierarchicalObjectLayerGameObject : LayerGameObject, IVisualizationWithPropertyData
+    {
+        private static readonly int baseColorID = Shader.PropertyToID("_BaseColor");
+        public override BoundingBox Bounds => CalculateWorldBoundsFromRenderers();
+        public bool DebugBoundingBox = false;
+
+        private int snappingCullingMask = 0;
+        private bool meshIsScatterable = true;
+
+        private BoundingBox CalculateWorldBoundsFromRenderers()
+        {
+            var renderers = GetComponentsInChildren<Renderer>(); //needs to be optimized if we call this function every frame.
+            if (renderers.Length == 0)
+            {
+                return null;
+            }
+
+            var combinedBounds = renderers[0].bounds;
+
+            for (var i = 1; i < renderers.Length; i++)
+            {
+                var renderer = renderers[i];
+                combinedBounds.Encapsulate(renderer.bounds);
+            }
+
+            var bl = new Coordinate(combinedBounds.min);
+            var tr = new Coordinate(combinedBounds.max);
+            return new BoundingBox(bl, tr);
+        }
+
+        [SerializeField] private UnityEvent<GameObject> objectCreated = new();
+
+        private Coordinate previousCoordinate;
+        private Quaternion previousRotation;
+        private Vector3 previousScale;
+        public WorldTransform WorldTransform { get; private set; }
+
+        [SerializeField] protected string scaleUnitCharacter = "%";
+        
+        protected override void OnVisualizationInitialize()
+        {
+            snappingCullingMask = (1 << LayerMask.NameToLayer("Terrain")) | (1 << LayerMask.NameToLayer("Buildings"));
+            WorldTransform = GetComponent<WorldTransform>();
+        }
+
+        protected override void OnEnable()
+        {
+            base.OnEnable();
+            ClickNothingPlane.ClickedOnNothing.AddListener(OnMouseClickNothing);
+        }
+
+        protected override void OnDisable()
+        {
+            base.OnDisable();
+            ClickNothingPlane.ClickedOnNothing.RemoveListener(OnMouseClickNothing);
+        }
+        
+        protected override void OnVisualizationReady()
+        {
+            TransformLayerPropertyData transformProperty = LayerData.GetProperty<TransformLayerPropertyData>();
+            transformProperty.IsEditable = true;
+            UpdatePosition(transformProperty.Position);
+            UpdateRotation(transformProperty.EulerRotation);
+            UpdateScale(transformProperty.LocalScale);
+            meshIsScatterable = MeshIsWithinMaxScatterVertexCount();
+            
+            ToggleScatterPropertyData scatterProperty = LayerData.GetProperty<ToggleScatterPropertyData>();
+            if(scatterProperty != null)
+            {
+                scatterProperty.IsEditable = LayerData.ParentLayer.HasProperty<PolygonSelectionLayerPropertyData>();  //we want to show the panel if the layer is scatterable
+                scatterProperty.AllowScatter = meshIsScatterable;  //we want to show a message why we cannot scatter when the layer is scatterable but the mesh is not
+            }
+
+            WorldTransform.RecalculatePositionAndRotation();
+            previousCoordinate = WorldTransform.Coordinate;
+            previousRotation = WorldTransform.Rotation;
+            previousScale = transform.localScale;
+
+            objectCreated.Invoke(gameObject);       
+        }
+
+        private void UpdatePosition(Coordinate newPosition)
+        {
+            WorldTransform.MoveToCoordinate(newPosition);
+        }
+
+        private void UpdateRotation(Vector3 newAngles)
+        {
+            WorldTransform.SetRotation(Quaternion.Euler(newAngles));
+        }
+
+        private void UpdateScale(Vector3 newScale)
+        {
+            if (newScale != transform.localScale)
+                transform.localScale = newScale;
+        }
+
+        public void SnapToGround()
+        {
+            Vector3 currentPosition = transform.position;
+            BoundingBox bounds = Bounds;
+            Vector3 boundsCenter = bounds.Center.ToUnity();
+
+            var context = new SnapContext
+            {
+                HeightExtent = bounds.Size.ToUnity().y * 0.5f,
+                PivotOffset = boundsCenter.y - currentPosition.y,
+                PreviousPosition = currentPosition,
+                Target = this,
+                Raycaster = ServiceLocator.GetService<OpticalRaycaster>(),
+                cullingMask = snappingCullingMask
+            };
+
+            context.SnapFromPosition(new Vector3(currentPosition.x, boundsCenter.y, currentPosition.z));
+        }
+
+        private struct SnapContext
+        {
+            public float HeightExtent;
+            public float PivotOffset;
+            public Vector3 PreviousPosition;
+            public OpticalRaycaster Raycaster;
+            public HierarchicalObjectLayerGameObject Target;
+            public int cullingMask;
+
+            public void SnapFromPosition(Vector3 position)
+            {
+                var isHit = Raycaster.Raycast(
+                    position,
+                    Vector3.down,
+                    out var hitPosition,
+                    cullingMask
+                );
+                OnRaycastDown(hitPosition, isHit);
+            }
+
+            private void OnRaycastDown(Vector3 worldPos, bool hit)
+            {
+                if (hit)
+                {
+                    Coordinate target = new Coordinate(worldPos + Vector3.up * (HeightExtent - PivotOffset));
+                    Target.UpdatePosition(target);
+                }
+                else
+                {
+                    var isHit = Raycaster.Raycast(
+                        PreviousPosition,
+                        Vector3.up,
+                        out var hitPosition,
+                        cullingMask
+                    );
+                    OnRaycastUp(hitPosition, isHit);
+                }
+            }
+
+            private void OnRaycastUp(Vector3 worldPos, bool hit)
+            {
+                if (hit)
+                {
+                    Coordinate target = new Coordinate(worldPos + Vector3.up * (-HeightExtent - PivotOffset));
+                    Target.UpdatePosition(target);
+                }
+                else
+                {
+                    Coordinate target = new Coordinate(PreviousPosition);
+                    HeightMap heightMap = ServiceLocator.GetService<HeightMap>();
+                    float height = heightMap.GetHeight(target);
+                    target.height = height;
+                    Target.UpdatePosition(target);
+                }
+            }
+        }
+
+        public virtual void LoadProperties(List<LayerPropertyData> properties)
+        {
+            InitProperty<TransformLayerPropertyData>(properties, null, new Coordinate(transform.position),
+                        transform.eulerAngles,
+                        transform.localScale,
+                        scaleUnitCharacter);
+            InitProperty<ColorPropertyData>(properties);
+            InitProperty<ToggleScatterPropertyData>(properties, p =>
+            {
+                p.IsEditable = LayerData.ParentLayer.HasProperty<PolygonSelectionLayerPropertyData>(); //we want to show the panel if the layer is scatterable
+                p.AllowScatter = meshIsScatterable; //we want to show a message why we cannot scatter when the layer is scatterable but the mesh is not
+            });
+        }
+
+        protected override void RegisterEventListeners()
+        {
+            base.RegisterEventListeners();
+            var transformPropertyData = LayerData.GetProperty<TransformLayerPropertyData>();
+            transformPropertyData.OnPositionChanged.AddListener(UpdatePosition);
+            transformPropertyData.OnRotationChanged.AddListener(UpdateRotation);
+            transformPropertyData.OnScaleChanged.AddListener(UpdateScale);
+
+            var toggleScatterPropertyData = LayerData.GetProperty<ToggleScatterPropertyData>();
+            if(toggleScatterPropertyData != null) toggleScatterPropertyData.IsScatteredChanged.AddListener(ConvertToScatterLayer);
+
+            var importedObject = GetComponent<IImportedObject>();
+            if (importedObject != null)
+            {
+                importedObject.ObjectVisualized.AddListener(OnImportedObjectVisualized);
+            }
+        }
+
+        protected override void UnregisterEventListeners()
+        {
+            base.UnregisterEventListeners();
+            var transformPropertyData = LayerData.GetProperty<TransformLayerPropertyData>();
+            transformPropertyData?.OnPositionChanged.RemoveListener(UpdatePosition);
+            transformPropertyData?.OnRotationChanged.RemoveListener(UpdateRotation);
+            transformPropertyData?.OnScaleChanged.RemoveListener(UpdateScale);
+
+            var toggleScatterPropertyData = LayerData.GetProperty<ToggleScatterPropertyData>();
+            if (toggleScatterPropertyData != null) toggleScatterPropertyData.IsScatteredChanged.RemoveListener(ConvertToScatterLayer);
+            
+            var importedObject = GetComponent<IImportedObject>();
+            if (importedObject != null)
+            {
+                importedObject.ObjectVisualized.RemoveListener(OnImportedObjectVisualized);
+            }
+        }
+
+        protected virtual void Update()
+        {
+            var transformPropertyData = LayerData.GetProperty<TransformLayerPropertyData>();
+            
+            //Position and rotation changes are handled by the WorldTransform, but should be updated in the project data
+            //todo: add a == and != operator to Coordinate.cs to avoid having to do this
+            if (Math.Abs(WorldTransform.Coordinate.value1 - previousCoordinate.value1) > 0.0001d ||
+                Math.Abs(WorldTransform.Coordinate.value2 - previousCoordinate.value2) > 0.0001d ||
+                Math.Abs(WorldTransform.Coordinate.value3 - previousCoordinate.value3) > 0.0001d)
+            {
+                transformPropertyData.Position = WorldTransform.Coordinate;
+                previousCoordinate = WorldTransform.Coordinate;
+            }
+
+            if (WorldTransform.Rotation != previousRotation)
+            {
+                transformPropertyData.EulerRotation = WorldTransform.Rotation.eulerAngles;
+                previousRotation = WorldTransform.Rotation;
+            }
+
+            // Check for scale change
+            if (transform.localScale != previousScale)
+            {
+                transformPropertyData.LocalScale = transform.localScale;
+                previousScale = transform.localScale;
+            }
+
+            //enable this to debug the exact bounds in worldspace, based on the Bounds (3d)
+            if (DebugBoundingBox)
+                Bounds.Debug(Color.magenta);
+        }
+
+        public override void OnLayerActiveInHierarchyChanged(bool isActive)
+        {
+            if (LayerData.IsSelected) // when the layerdata is selected and the visibility changes, we need to attach/detach the transform handles
+            {
+                if (isActive)
+                    AttachToTransformHandles();
+                else
+                    ClearTransformHandles();
+            }
+
+            gameObject.SetActive(isActive);
+        }
+
+        private void OnMouseClickNothing()
+        {
+            if (LayerData.IsSelected)
+            {
+                LayerData.DeselectLayer();
+            }
+        }
+
+        public override void OnSelect(LayerData layer)
+        {
+            AttachToTransformHandles();
+        }
+
+        public override void OnDeselect(LayerData layer)
+        {
+            ClearTransformHandles();
+        }
+        
+        private void AttachToTransformHandles()
+        {
+            var transformInterfaceToggle = ServiceLocator.GetService<TransformHandleInterfaceToggle>();
+
+            if (!transformInterfaceToggle)
+            {
+                Debug.LogError("Transform handles interface toggles not found, cannot set transform target");
+            }
+            else
+            {
+                ToggleScatterPropertyData toggleScatterPropertyData = LayerData.LayerProperties.Get<ToggleScatterPropertyData>();
+                if (toggleScatterPropertyData != null && toggleScatterPropertyData.IsScattered) //todo: check if this if is still needed, since we changed the Visualisation spawning
+                {
+                    transformInterfaceToggle.ClearTransformTarget();
+                    return;
+                }
+                
+                transformInterfaceToggle.SetTransformTarget(gameObject);
+                transformInterfaceToggle.SnapTarget.AddListener(SnapToGround);
+            }
+        }
+
+        protected void ClearTransformHandles()
+        {
+            var transformInterfaceToggle = ServiceLocator.GetService<TransformHandleInterfaceToggle>();
+
+            if (transformInterfaceToggle)
+            {
+                transformInterfaceToggle.ClearTransformTarget();
+                transformInterfaceToggle.SnapTarget.RemoveListener(SnapToGround);
+            }
+        }
+
+        public override void OnLayerDataParentChanged()
+        {
+            var layerCanScatter = LayerData.ParentLayer.HasProperty<PolygonSelectionLayerPropertyData>();
+            var toggleScatterPropertyData = LayerData.LayerProperties.Get<ToggleScatterPropertyData>();
+            toggleScatterPropertyData.IsEditable = layerCanScatter;  //we want to show the panel if the layer is scatterable
+            toggleScatterPropertyData.AllowScatter = meshIsScatterable; //we want to show a message why we cannot scatter when the layer is scatterable but the mesh is not
+
+            var propertyPanelService = ServiceLocator.GetService<PropertyPanelBehaviour>();
+            if (propertyPanelService.activeLayer == LayerData) //reload the property section if the settings changed
+            {
+                propertyPanelService.SpawnPanel(LayerData);
+            }
+        }
+
+        private void OnImportedObjectVisualized(GameObject importedObject)
+        {
+            ApplyStyling();
+        }
+        
+        public override void ApplyStyling()
+        {
+            // Dynamically create a list of Layer features because a different set of renderers could be present after
+            // an import or replacement.
+            var features = CreateFeaturesByType<MeshRenderer>();
+
+           
+            // Apply style to the features that was discovered
+            foreach (var feature in features)
+            {
+                if (feature.Geometry is not MeshRenderer meshRenderer) return;
+
+                Symbolizer styling = GetStyling(feature);
+                var fillColor = styling.GetFillColor();
+
+                // Keep the original material color if fill color is not set (null)
+                if (!fillColor.HasValue) return;
+
+                LayerData.Color = fillColor.Value;
+                var block = new MaterialPropertyBlock();
+                for (int m = 0; m <= meshRenderer.sharedMaterials.Length - 1; m++)
+                {
+                    meshRenderer.GetPropertyBlock(block, m);
+                    block.SetColor(baseColorID, fillColor.Value);
+                    meshRenderer.SetPropertyBlock(block, m);
+                }
+            }
+
+            base.ApplyStyling();
+        }
+
+        private void ConvertToScatterLayer(bool isScattered)
+        {
+            if (!isScattered)
+                return;            
+           
+            InitProperty<ScatterGenerationSettingsPropertyData>(LayerData.LayerProperties, null, LayerData.PrefabIdentifier);
+
+            var transformInterfaceToggle = ServiceLocator.GetService<TransformHandleInterfaceToggle>();
+            transformInterfaceToggle.ClearTransformTarget();
+
+            TransformLayerPropertyData transformLayerPropertyData = LayerData.GetProperty<TransformLayerPropertyData>();
+            transformLayerPropertyData.IsEditable = false;
+            ScatterGenerationSettingsPropertyData scatterGenerationSettings = LayerData.GetProperty<ScatterGenerationSettingsPropertyData>();
+            scatterGenerationSettings.IsEditable = true;
+            App.Layers.VisualizeAs(LayerData, ObjectScatterLayerGameObject.ScatterBasePrefabID);
+        }
+
+        private bool MeshIsWithinMaxScatterVertexCount()
+        {
+            var meshFilters = transform.GetComponentsInChildren<MeshFilter>();
+            int vertexCount = 0;
+            for (int i = 0; i < meshFilters.Length; i++)
+            {
+                vertexCount += meshFilters[i].sharedMesh.vertexCount;
+                if (vertexCount > 65535)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+    }
+}

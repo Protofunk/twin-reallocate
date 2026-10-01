@@ -1,0 +1,10 @@
+﻿name: Activate unity license
+on:
+  workflow_dispatch: {}
+jobs:
+  activation:
+    runs-on: ubuntu-latest
+    name: "Activate professional license"
+    steps:
+      - name: Unity - Activate
+        uses: game-ci/unity-activate@v2.0.0
